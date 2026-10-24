@@ -3211,7 +3211,9 @@ absl::StatusOr<const Index*> SchemaUpdaterImpl::CreateForeignKeyIndex(
   GOOGLESQL_ASSIGN_OR_RETURN(std::string index_name,
                    global_names_.GenerateManagedIndexName(
                        table->Name(), column_names, null_filtered, unique));
-  const Index* index = latest_schema_->FindIndex(index_name);
+  // The fingerprint distinguishes indexes with the same truncated prefix.
+  // FindIndex's fallback ignores it to support production index query hints.
+  const Index* index = latest_schema_->FindIndexCaseSensitive(index_name);
   if (index == nullptr) {
     index = statement_context_->FindAddedNode<Index>(index_name);
   }

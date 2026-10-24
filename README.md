@@ -55,6 +55,43 @@ docker run -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator:$VER
 ```
 Works on x86 and arm64 architectures.
 
+### Fork images on GitHub Container Registry
+
+This fork publishes `ghcr.io/remiphilippe/cloud-spanner-emulator` for
+`linux/amd64` and `linux/arm64`. The [Container image workflow](
+https://github.com/remiphilippe/cloud-spanner-emulator/actions/workflows/container-image.yml)
+uses the same `build/docker/Dockerfile.ubuntu` as Google's release script,
+including optimized binaries, the distroless runtime, bundled licenses, ports,
+and startup command. The source includes the fork's fixes and OCI source/revision
+labels. Base-image tags and APT packages are mutable, so this is the same build
+recipe rather than a byte-for-byte reproduction of a previously released image.
+
+The workflow publishes on pushes to `master`, `codex/**` branches, and `v*` tags;
+it also supports manual runs once installed on the default branch. Tags include
+`sha-<full-commit-sha>`, the normalized branch name, and release tags. `latest`
+tracks the default branch only. The multi-platform tag is published after both
+architectures pass an image smoke test for the foreign-key regression and the
+upstream command, ports, and license archive.
+
+For reproducible tests, use the multi-platform digest printed in the workflow's
+publication summary:
+
+```shell
+docker run -p 9010:9010 -p 9020:9020 \
+  ghcr.io/remiphilippe/cloud-spanner-emulator@sha256:<published-index-digest>
+```
+
+Public packages support anonymous pulls. GitHub initially creates GHCR packages
+as private; the package administrator must select **Public** under **Package
+settings > Change visibility** after the first publication.
+
+Build caches are retained in `buildcache-amd64` and `buildcache-arm64` registry
+tags. Keep these tags to avoid rebuilding GoogleSQL on every change. Native
+hosted runners free preinstalled SDK disk space and restrict the builder to two
+CPU cores and 14 GiB of memory. A cold optimized build can take several hours;
+warm builds reuse the registry cache. Local development container caches are
+independent of the workflow.
+
 ### Via pre-built linux binaries
 
 The emulator is also distributed as a standalone linux binary. Note that this

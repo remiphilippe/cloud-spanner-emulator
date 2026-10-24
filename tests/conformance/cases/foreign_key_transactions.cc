@@ -14,6 +14,9 @@
 // limitations under the License.
 //
 
+#include <string>
+
+#include "absl/strings/substitute.h"
 #include "tests/common/scoped_feature_flags_setter.h"
 #include "tests/conformance/common/database_test_base.h"
 
@@ -101,6 +104,65 @@ TEST_F(ForeignKeyTransactionsTest, InsertReferencingRowWithoutReferencedRow) {
   // The referencing key [2,1] does not match the referenced key [1,2].
   EXPECT_THAT(Commit({MakeInsert("U", {"X", "Y"}, 1, 2),
                       MakeInsert("T", {"A", "B"}, 1, 2)}),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+class ForeignKeyIndexNamesTest : public DatabaseTest,
+                                 public testing::WithParamInterface<bool> {
+ protected:
+  absl::Status SetUpDatabase() override {
+    return SetSchema({
+        absl::Substitute(R"(
+        CREATE TABLE $0 (
+          id INT64 NOT NULL,
+          $1 INT64,
+          extra INT64,
+        ) PRIMARY KEY (id)
+      )",
+                         parent_, column_),
+        absl::Substitute(R"(
+        CREATE TABLE $0 (
+          id INT64 NOT NULL,
+          $1 INT64 $3,
+          extra INT64,
+          CONSTRAINT composite_fk FOREIGN KEY ($1, extra)
+            REFERENCES $2 ($1, extra),
+        ) PRIMARY KEY (id)
+      )",
+                         child_, column_, parent_,
+                         GetParam() ? "" : "NOT NULL"),
+        absl::Substitute(R"(
+        ALTER TABLE $0 ADD CONSTRAINT single_column_fk
+          FOREIGN KEY ($1) REFERENCES $2 ($1)
+      )",
+                         child_, column_, parent_),
+    });
+  }
+
+  const std::string parent_ =
+      "referenced_table_with_a_long_name_for_managed_index_regression";
+  const std::string child_ =
+      "referencing_table_with_a_long_name_for_managed_index_regression";
+  const std::string column_ =
+      "foreign_key_column_with_a_long_name_for_index_regression";
+};
+
+INSTANTIATE_TEST_SUITE_P(Nullability, ForeignKeyIndexNamesTest,
+                         testing::Bool());
+
+TEST_P(ForeignKeyIndexNamesTest, InsertRowsWithTruncatedForeignKeyIndexNames) {
+  // A nullable extra column excludes the parent from the composite index,
+  // but the single-column foreign key must still find it in its own index.
+  GOOGLESQL_ASSERT_OK(Commit({MakeInsert(child_, {"id", column_}, 1, 10),
+                              MakeInsert(parent_, {"id", column_}, 1, 10)}));
+  GOOGLESQL_ASSERT_OK(Insert(parent_, {"id", column_}, {2, 20}));
+  GOOGLESQL_EXPECT_OK(Insert(child_, {"id", column_}, {2, 20}));
+  GOOGLESQL_ASSERT_OK(
+      Commit({MakeInsert(child_, {"id", column_, "extra"}, 3, 30, 40),
+              MakeInsert(parent_, {"id", column_, "extra"}, 3, 30, 40)}));
+  EXPECT_THAT(Insert(child_, {"id", column_}, {4, 50}),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_THAT(Insert(child_, {"id", column_, "extra"}, {4, 30, 41}),
               StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 

@@ -1,0 +1,207 @@
+name: Container image
+
+on:
+  push:
+    branches:
+      - master
+      - codex/**
+    tags:
+      - v*
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: container-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Free hosted runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          df -h /
+          available=$(df -B1 --output=avail / | tail -n 1)
+          if (( available < 32 * 1024 * 1024 * 1024 )); then
+            echo 'The upstream Bazel image build requires at least 32 GiB of free disk.' >&2
+            exit 1
+          fi
+
+      - name: Set up native builder
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker-container
+          driver-opts: |
+            memory=14g
+            cpuset-cpus=0-1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+
+      - name: Build upstream release image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: build/docker/Dockerfile.ubuntu
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Smoke test release image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker run --detach --name emulator-smoke \
+            --publish 127.0.0.1:9010:9010 --publish 127.0.0.1:9020:9020 \
+            "$IMAGE@$DIGEST"
+          docker inspect emulator-smoke | jq -e \
+            '.[0].Config | .Cmd == ["./gateway_main", "--hostname", "0.0.0.0"] and (.ExposedPorts | keys == ["9010/tcp", "9020/tcp"])'
+          docker cp emulator-smoke:/licenses.txt.gz "$RUNNER_TEMP/licenses.txt.gz"
+          python3 -c 'import gzip, sys; assert gzip.open(sys.argv[1], "rb").read(1), "empty license archive"' \
+            "$RUNNER_TEMP/licenses.txt.gz"
+          python3 .github/scripts/smoke-image.py --endpoint http://127.0.0.1:9020
+
+      - name: Export tested digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload tested digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Capture smoke logs
+        if: always()
+        run: |
+          if docker inspect emulator-smoke >/dev/null 2>&1; then
+            docker logs emulator-smoke > "$RUNNER_TEMP/image-smoke.log" 2>&1
+          else
+            echo 'The build ended before the smoke container started.' > "$RUNNER_TEMP/image-smoke.log"
+          fi
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image-smoke.log
+          retention-days: 7
+
+  publish:
+    name: Publish multi-platform image
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download tested digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - name: Set up builder
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Publish tested manifest
+        env:
+          METADATA: ${{ steps.metadata.outputs.json }}
+        run: |
+          mapfile -t digests < <(find "$RUNNER_TEMP/digests" -type f -printf '%f\n' | sort)
+          if (( ${#digests[@]} != 2 )); then
+            echo 'Expected one tested digest per architecture.' >&2
+            exit 1
+          fi
+          images=()
+          for digest in "${digests[@]}"; do
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+            images+=("$IMAGE@sha256:$digest")
+          done
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
+          arguments=()
+          for tag in "${tags[@]}"; do
+            arguments+=(--tag "$tag")
+          done
+          docker buildx imagetools create "${arguments[@]}" "${images[@]}"
+          reference="$IMAGE:sha-$GITHUB_SHA"
+          docker buildx imagetools inspect --raw "$reference" | jq -e \
+            '[.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]'
+          digest=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$reference" | jq -er '.digest')
+          {
+            echo '### Published emulator image'
+            echo
+            printf "\`%s@%s\`\n\n" "$IMAGE" "$digest"
+            printf 'Tags:\n\n'
+            printf -- "- \`%s\`\n" "${tags[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"

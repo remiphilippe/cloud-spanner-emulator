@@ -279,6 +279,94 @@ TEST_P(ForeignKeyTest, CreateTableWithForeignKey) {
                               "IDX_T_X_Y_U_5AD6E41B495C5BB9", "")));
 }
 
+TEST_P(ForeignKeyTest, ManagedIndexesWithSameTruncatedPrefixAreDistinct) {
+  const std::string referenced_table_name =
+      "referenced_table_with_a_long_name_for_managed_index_regression";
+  const std::string referencing_table_name =
+      "referencing_table_with_a_long_name_for_managed_index_regression";
+  const std::string column_name =
+      "foreign_key_column_with_a_long_name_for_index_regression";
+
+  // Both index names are truncated within the first column's name, so only
+  // their fingerprints distinguish the single-column and composite indexes.
+  for (bool composite_first : {false, true}) {
+    SCOPED_TRACE(composite_first);
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto schema, CreateSchema({
+                         absl::Substitute(R"(
+          CREATE TABLE $0 (
+            id INT64 NOT NULL,
+            $1 INT64,
+            extra INT64,
+          ) PRIMARY KEY (id)
+        )",
+                                          referenced_table_name, column_name),
+                         absl::Substitute(R"(
+          CREATE TABLE $0 (
+            id INT64 NOT NULL,
+            $1 INT64,
+            extra INT64,
+          ) PRIMARY KEY (id)
+        )",
+                                          referencing_table_name, column_name),
+                     }));
+    const std::string single_column_constraint = absl::Substitute(
+        R"(
+      ALTER TABLE $0 ADD CONSTRAINT single_column_fk
+        FOREIGN KEY ($1) REFERENCES $2 ($1)
+    )",
+        referencing_table_name, column_name, referenced_table_name);
+    const std::string composite_constraint = absl::Substitute(
+        R"(
+      ALTER TABLE $0 ADD CONSTRAINT composite_fk
+        FOREIGN KEY ($1, extra) REFERENCES $2 ($1, extra)
+    )",
+        referencing_table_name, column_name, referenced_table_name);
+    GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+        auto updated_schema,
+        UpdateSchema(schema.get(),
+                     {
+                         composite_first ? composite_constraint
+                                         : single_column_constraint,
+                         composite_first ? single_column_constraint
+                                         : composite_constraint,
+                         absl::Substitute(R"(
+          ALTER TABLE $0 ADD CONSTRAINT repeated_fk
+            FOREIGN KEY ($1) REFERENCES $2 ($1)
+        )",
+                                          referencing_table_name, column_name,
+                                          referenced_table_name),
+                     }));
+
+    const Table* table =
+        ASSERT_NOT_NULL(updated_schema->FindTable(referencing_table_name));
+    const ForeignKey* single =
+        ASSERT_NOT_NULL(table->FindForeignKey("single_column_fk"));
+    const ForeignKey* composite =
+        ASSERT_NOT_NULL(table->FindForeignKey("composite_fk"));
+    const ForeignKey* repeated =
+        ASSERT_NOT_NULL(table->FindForeignKey("repeated_fk"));
+    for (bool referenced : {false, true}) {
+      SCOPED_TRACE(referenced ? "referenced" : "referencing");
+      const Index* single_index =
+          ASSERT_NOT_NULL(referenced ? single->referenced_index()
+                                     : single->referencing_index());
+      const Index* composite_index =
+          ASSERT_NOT_NULL(referenced ? composite->referenced_index()
+                                     : composite->referencing_index());
+      EXPECT_NE(single_index, composite_index);
+      EXPECT_EQ(single_index, referenced ? repeated->referenced_index()
+                                         : repeated->referencing_index());
+      ASSERT_EQ(single_index->key_columns().size(), 1);
+      EXPECT_EQ(single_index->key_columns()[0]->column()->Name(), column_name);
+      ASSERT_EQ(composite_index->key_columns().size(), 2);
+      EXPECT_EQ(composite_index->key_columns()[0]->column()->Name(),
+                column_name);
+      EXPECT_EQ(composite_index->key_columns()[1]->column()->Name(), "extra");
+    }
+  }
+}
+
 TEST_P(ForeignKeyTest, CreateTableWithForeignKeyAction) {
   GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto schema, CreateSchema({
                                         R"(
