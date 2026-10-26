@@ -19,6 +19,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 
@@ -27,6 +28,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	// We need this to make sure that the gateway can serialize the google.rpc.ErrorInfo proto.
@@ -38,8 +40,8 @@ import (
 	instancepb "cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	lrgw "cloud_spanner_emulator/gateway/longrunning_operations_gateway"
 	dagw "cloud_spanner_emulator/gateway/spanner_admin_database_gateway"
-	spgw "cloud_spanner_emulator/gateway/spanner_gateway"
 	iagw "cloud_spanner_emulator/gateway/spanner_admin_instance_gateway"
+	spgw "cloud_spanner_emulator/gateway/spanner_gateway"
 )
 
 // Options encapsulates options for the emulator gateway.
@@ -96,7 +98,6 @@ func (gw *Gateway) Run() {
 		fmt.Sprintf("--override_change_stream_partition_token_alive_seconds=%d",
 			gw.opts.OverrideChangeStreamPartitionTokenAliveSeconds))
 
-
 	cmd := exec.Command(gw.opts.FrontendBinary, emulatorArgs...)
 
 	// Proxy emulator log to gateway log.
@@ -107,6 +108,11 @@ func (gw *Gateway) Run() {
 		cmd.Stderr = os.Stderr
 	}
 
+	// Handle shutdown before starting the backend so signals cannot orphan it
+	// during startup.
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
 	// Start the grpc server but won't block for the grpc server to be up.
 	err := cmd.Start()
 	if err != nil {
@@ -114,25 +120,9 @@ func (gw *Gateway) Run() {
 	}
 
 	// Terminate the grpc server if the gateway server is terminated.
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
 	go func() {
-		<-c
-		// Release resources e.g., network ports associated with the process.
-		// This is required since gateway may receive an interrupt signal for
-		// shutdown before Wait() returns.
-		cmd.Process.Release()
-		cmd.Process.Kill()
-		os.Exit(0)
+		os.Exit(waitForEmulator(cmd, c))
 	}()
-
-	// Terminate the gateway server if the grpc server is terminated.
-	go func() {
-		cmd.Wait()
-		log.Println("Shutting down gateway server since grpc server is terminated.")
-		os.Exit(cmd.ProcessState.ExitCode())
-	}()
-
 
 	// Wait for the grpc server to be up.
 	ctx := context.Background()
@@ -172,6 +162,27 @@ func (gw *Gateway) Run() {
 	}
 }
 
+// waitForEmulator reaps the backend before the gateway exits, including when
+// only the gateway receives a shutdown signal.
+func waitForEmulator(cmd *exec.Cmd, signals <-chan os.Signal) int {
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-signals:
+		// Release must not precede Kill: Release makes the process unusable.
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("Terminating grpc server: %v", err)
+		}
+		<-done
+		return 0
+	case <-done:
+		log.Println("Shutting down gateway server since grpc server is terminated.")
+		if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() < 0 {
+			return 1
+		}
+		return cmd.ProcessState.ExitCode()
+	}
+}
 
 func waitForReady(ctx context.Context, endpoint string) error {
 	timeout := 30 * time.Second

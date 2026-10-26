@@ -22,6 +22,7 @@
 #include "google/rpc/error_details.pb.h"
 #include "google/rpc/status.pb.h"
 #include "absl/strings/cord.h"
+#include "common/constants.h"
 #include "common/limits.h"
 #include "grpcpp/support/status.h"
 #include "third_party/spanner_pg/errors/errors.pb.h"
@@ -44,6 +45,11 @@ google::rpc::Status ToRpcStatus(const absl::Status& status,
   result.set_message(status_message);
   status.ForEachPayload(
       [&](absl::string_view type_url, const absl::Cord& payload) {
+        // This is an internal transaction marker, not a protobuf message.
+        // Sending it as an Any prevents REST clients from decoding the error.
+        if (type_url == kConstraintError) {
+          return;
+        }
         google::protobuf::Any* any = result.add_details();
         std::string type(type_url);
         any->set_type_url(type);

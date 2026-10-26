@@ -138,7 +138,8 @@ absl::Status ValidateGeneratedColumnsNotPresent(
 }
 
 bool AreAllDependentColumnsPresent(const Column* column,
-                                   const std::vector<const Column*>& columns) {
+                                   const std::vector<const Column*>& columns,
+                                   bool allow_default_values) {
   // Checks if user has supplied values for all dependent columns of a key
   // generated column.
   ABSL_DCHECK(column->is_generated());
@@ -146,12 +147,12 @@ bool AreAllDependentColumnsPresent(const Column* column,
     // A generated dependent column should have all dependent columns on the
     // generated column present.
     // Non-generated dependent column should be specified by user.
-    // If a dependent column is a default column and value is not provided,
-    // default value will be used to evaluate the key column value.
-    if (dep_col->has_default_value()) continue;
+    // Defaults can supply missing dependencies for inserts, but not updates.
+    if (allow_default_values && dep_col->has_default_value()) continue;
     if (dep_col->is_generated() &&
         column->table()->FindKeyColumn(dep_col->Name()) != nullptr) {
-      if (!AreAllDependentColumnsPresent(dep_col, columns)) {
+      if (!AreAllDependentColumnsPresent(dep_col, columns,
+                                         allow_default_values)) {
         return false;
       }
     } else if (std::find(columns.begin(), columns.end(), dep_col) ==
@@ -179,7 +180,10 @@ absl::Status ValidateDefaultAndGeneratedKeys(
         op_type == MutationOpType::kUpdate) {
       return error::DefaultPKNeedsExplicitValue(column->FullName(), "UPDATE");
     } else if (column->is_generated() && !user_supplied_value &&
-               !AreAllDependentColumnsPresent(column, columns)) {
+               !AreAllDependentColumnsPresent(
+                   column, columns,
+                   /*allow_default_values=*/op_type !=
+                       MutationOpType::kUpdate)) {
       // For update mutations user should either supply value for generated key
       // columns or should supply values for all dependent columns on the key
       // column.

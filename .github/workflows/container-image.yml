@@ -103,6 +103,12 @@ jobs:
           python3 -c 'import gzip, sys; assert gzip.open(sys.argv[1], "rb").read(1), "empty license archive"' \
             "$RUNNER_TEMP/licenses.txt.gz"
           python3 .github/scripts/smoke-image.py --endpoint http://127.0.0.1:9020
+          mkdir -p "$RUNNER_TEMP/gateway-shutdown"
+          docker cp emulator-smoke:/gateway_main "$RUNNER_TEMP/gateway-shutdown/gateway_main"
+          docker cp emulator-smoke:/emulator_main "$RUNNER_TEMP/gateway-shutdown/emulator_main"
+          python3 .github/scripts/smoke-gateway-shutdown.py \
+            --gateway "$RUNNER_TEMP/gateway-shutdown/gateway_main" \
+            --backend "$RUNNER_TEMP/gateway-shutdown/emulator_main"
 
       - name: Export tested digest
         env:

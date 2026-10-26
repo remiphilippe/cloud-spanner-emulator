@@ -285,6 +285,45 @@ TEST_F(GeneratedPrimaryKeyReadWriteTest, InsertMutations) {
           {{1, 1, 1, 5}, {1, 2, 2, 6}, {2, 1, 1, 7}, {2, 200, 200, 8}}));
 }
 
+TEST_F(GeneratedPrimaryKeyReadWriteTest,
+       UpdatePreservesDefaultsWithGeneratedPrimaryKey) {
+  GOOGLESQL_ASSERT_OK(SetSchema({R"sql(CREATE TABLE UpdateDefaults (
+    id INT64 NOT NULL, generated_key INT64 AS (id * 2) STORED,
+    status STRING(16) NOT NULL DEFAULT ('draft'),
+    n INT64 NOT NULL DEFAULT (0), total INT64
+  ) PRIMARY KEY (generated_key))sql"}));
+  GOOGLESQL_ASSERT_OK(Insert("UpdateDefaults", {"id", "status", "n", "total"},
+                             {1, "sent", 5, 10}));
+  GOOGLESQL_ASSERT_OK(
+      Update("UpdateDefaults", {"generated_key", "total"}, {2, 11}));
+  EXPECT_THAT(ReadAll("UpdateDefaults", {"id", "status", "n", "total"}),
+              IsOkAndHoldsRows({{1, "sent", 5, 11}}));
+}
+
+TEST_F(GeneratedPrimaryKeyReadWriteTest,
+       UpdateGeneratedKeyRequiresExplicitDefaultDependencies) {
+  GOOGLESQL_ASSERT_OK(SetSchema({R"sql(CREATE TABLE KeyDefaults (
+    a INT64 DEFAULT (1), b INT64 DEFAULT (2),
+    g INT64 AS (a + b) STORED, total INT64
+  ) PRIMARY KEY (g))sql"}));
+  GOOGLESQL_ASSERT_OK(Insert("KeyDefaults", {"a", "b", "total"}, {10, 20, 1}));
+  GOOGLESQL_ASSERT_OK(Update("KeyDefaults", {"g", "total"}, {30, 2}));
+  EXPECT_THAT(ReadAll("KeyDefaults", {"a", "b", "g", "total"}),
+              IsOkAndHoldsRows({{10, 20, 30, 2}}));
+  EXPECT_THAT(Update("KeyDefaults", {"total"}, {3}),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_THAT(Update("KeyDefaults", {"g", "a", "total"}, {30, 10, 3}),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  GOOGLESQL_ASSERT_OK(
+      Update("KeyDefaults", {"g", "a", "b", "total"}, {30, 10, 20, 4}));
+  EXPECT_THAT(Update("KeyDefaults", {"g", "a", "b", "total"}, {30, 11, 20, 4}),
+              StatusIs(absl::StatusCode::kOutOfRange));
+  GOOGLESQL_ASSERT_OK(Update("KeyDefaults", {"a", "b", "total"}, {10, 20, 5}));
+  GOOGLESQL_ASSERT_OK(Insert("KeyDefaults", {"total"}, {6}));
+  EXPECT_THAT(ReadAll("KeyDefaults", {"a", "b", "g", "total"}),
+              IsOkAndHoldsRows({{1, 2, 3, 6}, {10, 20, 30, 5}}));
+}
+
 TEST_F(GeneratedPrimaryKeyReadWriteTest, CannotInsertInNonWriteableColumn) {
   // A few inserts:
   GOOGLESQL_ASSERT_OK(Commit({

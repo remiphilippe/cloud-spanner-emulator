@@ -87,8 +87,10 @@ cc_library(
     ],
     deps = [
         ":base",
+        "//backend/datamodel:key",
         "//backend/schema/catalog:schema",
         "//backend/schema/graph:schema_node",
+        "//backend/schema/parser:ddl_parser",
         "//backend/schema/printer:print_ddl",
         "//backend/schema/updater:global_schema_names",
         "//backend/schema/updater:schema_updater",
@@ -110,6 +112,7 @@ cc_library(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
         "@com_google_googleapis//google/spanner/admin/database/v1:database_cc_proto",
+        "@com_google_googlesql//googlesql/base:status",
         "@com_google_googlesql//googlesql/public:json_value",
         "@com_google_googlesql//googlesql/public:numeric_value",
         "@com_google_googlesql//googlesql/public:options_cc_proto",

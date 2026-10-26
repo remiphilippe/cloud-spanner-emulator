@@ -32,13 +32,18 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/substitute.h"
 #include "absl/types/span.h"
+#include "absl/time/time.h"
+#include "backend/datamodel/key.h"
 #include "backend/schema/catalog/schema.h"
+#include "backend/schema/catalog/foreign_key.h"
 #include "backend/schema/catalog/table.h"
+#include "backend/schema/parser/ddl_parser.h"
 #include "backend/schema/printer/print_ddl.h"
 #include "backend/schema/updater/schema_updater.h"
 #include "backend/schema/updater/schema_updater_tests/base.h"
 #include "common/errors.h"
 #include "third_party/spanner_pg/datatypes/extended/spanner_extended_type.h"
+#include "googlesql/base/status_macros.h"
 
 namespace google {
 namespace spanner {
@@ -1093,6 +1098,202 @@ TEST_P(SchemaUpdaterTest, DropIndex) {
   // Check that the index data table (and other dependent nodes) are
   // also deleted.
   EXPECT_EQ(new_schema->GetSchemaGraph()->GetSchemaNodes().size(), 4);
+}
+
+class StorageCleanupTest : public SchemaUpdaterTest {
+ protected:
+  absl::StatusOr<SchemaChangeResult> ApplySchema(
+      const Schema* schema, absl::Span<const std::string> statements) {
+    std::vector<std::string> translated;
+    if (GetParam() == POSTGRESQL) {
+      for (const std::string& statement : statements) {
+        ddl::DDLStatement parsed;
+        GOOGLESQL_RETURN_IF_ERROR(ddl::ParseDDLStatement(statement, &parsed));
+        GOOGLESQL_ASSIGN_OR_RETURN(
+            auto printed,
+            pg_schema_printer_->PrintDDLStatementForEmulator(parsed));
+        translated.push_back(absl::StrJoin(printed, " "));
+      }
+      statements = translated;
+    }
+    SchemaChangeContext context{
+        .type_factory = &type_factory_,
+        .table_id_generator = &table_id_generator_,
+        .queue_id_generator = &queue_id_generator_,
+        .column_id_generator = &column_id_generator_,
+        .storage = storage_.get(),
+        .schema_change_timestamp = absl::UnixEpoch(),
+        .pg_oid_assigner = pg_oid_assigner_.get(),
+    };
+    SchemaUpdater updater;
+    return updater.UpdateSchemaFromDDL(
+        schema, {.statements = statements, .database_dialect = GetParam()},
+        context);
+  }
+
+  absl::StatusOr<std::unique_ptr<const Schema>> CreatePopulatedSchema() {
+    GOOGLESQL_ASSIGN_OR_RETURN(
+        auto schema, CreateSchema({
+                         "CREATE TABLE T (k INT64, v INT64) PRIMARY KEY (k)",
+                         "CREATE INDEX I ON T(v)",
+                         "CREATE INDEX J ON T(k)",
+                     }));
+    const Table* table = schema->FindTable("T");
+    for (int row : {1, 2}) {
+      GOOGLESQL_RETURN_IF_ERROR(storage_->Write(
+          absl::UnixEpoch(), table->id(), Key({googlesql::values::Int64(row)}),
+          {table->FindColumn("k")->id(), table->FindColumn("v")->id()},
+          {googlesql::values::Int64(row), googlesql::values::Int64(7)}));
+    }
+    for (const char* name : {"I", "J"}) {
+      GOOGLESQL_RETURN_IF_ERROR(storage_->Write(
+          absl::UnixEpoch(), schema->FindIndex(name)->index_data_table()->id(),
+          Key({googlesql::values::Int64(1)}), {}, {}));
+    }
+    return schema;
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    StorageCleanupPerDialect, StorageCleanupTest,
+    testing::Values(database_api::DatabaseDialect::GOOGLE_STANDARD_SQL,
+                    POSTGRESQL));
+
+TEST_P(StorageCleanupTest, DropIndexReclaimsBackingStorage) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto schema, CreateSchema({
+                       "CREATE TABLE T (k INT64, v INT64) PRIMARY KEY (k)",
+                       "CREATE INDEX Idx ON T(v)",
+                       "CREATE TABLE Dropped (k INT64) PRIMARY KEY (k)",
+                   }));
+  const TableID index_table_id =
+      schema->FindIndex("Idx")->index_data_table()->id();
+  const TableID table_id = schema->FindTable("Dropped")->id();
+  const Key key({googlesql::values::Int64(1)});
+  const absl::Time timestamp = absl::UnixEpoch();
+  for (const TableID& id : {index_table_id, table_id}) {
+    GOOGLESQL_ASSERT_OK(storage_->Write(timestamp, id, key, {}, {}));
+  }
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto applied,
+      ApplySchema(schema.get(), {"DROP TABLE Dropped", "DROP INDEX Idx"}));
+  GOOGLESQL_ASSERT_OK(applied.backfill_status);
+  EXPECT_EQ(applied.updated_schema->FindIndex("Idx"), nullptr);
+  storage_->CleanUpDeletedTables(timestamp + absl::Minutes(59));
+  for (const TableID& id : {index_table_id, table_id}) {
+    GOOGLESQL_EXPECT_OK(storage_->Lookup(timestamp, id, key, {}, nullptr));
+  }
+  storage_->CleanUpDeletedTables(timestamp + absl::Hours(1));
+  for (const TableID& id : {index_table_id, table_id}) {
+    EXPECT_THAT(storage_->Lookup(timestamp, id, key, {}, nullptr),
+                googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  }
+}
+
+TEST_P(StorageCleanupTest, DropLastForeignKeyReclaimsManagedIndexStorage) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto schema,
+      CreateSchema({
+          "CREATE TABLE P (id INT64, v INT64) PRIMARY KEY (id)",
+          "CREATE TABLE C (id INT64, v INT64, "
+          "CONSTRAINT FK1 FOREIGN KEY (v) REFERENCES P(v), "
+          "CONSTRAINT FK2 FOREIGN KEY (v) REFERENCES P(v)) PRIMARY KEY (id)",
+      }));
+  const ForeignKey* foreign_key = schema->FindTable("C")->FindForeignKey("FK1");
+  ASSERT_NE(foreign_key, nullptr);
+  ASSERT_NE(foreign_key->referencing_index(), nullptr);
+  ASSERT_NE(foreign_key->referenced_index(), nullptr);
+  const std::vector<TableID> index_table_ids = {
+      foreign_key->referencing_index()->index_data_table()->id(),
+      foreign_key->referenced_index()->index_data_table()->id(),
+  };
+  const absl::Time timestamp = absl::UnixEpoch();
+  const Key key({googlesql::values::Int64(1)});
+  for (const TableID& id : index_table_ids) {
+    GOOGLESQL_ASSERT_OK(storage_->Write(timestamp, id, key, {}, {}));
+  }
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto first_drop,
+      ApplySchema(schema.get(), {"ALTER TABLE C DROP CONSTRAINT FK1"}));
+  GOOGLESQL_ASSERT_OK(first_drop.backfill_status);
+  EXPECT_NE(first_drop.updated_schema->FindTable("C")->FindForeignKey("FK2"),
+            nullptr);
+  storage_->CleanUpDeletedTables(timestamp + absl::Hours(1));
+  for (const TableID& id : index_table_ids) {
+    GOOGLESQL_EXPECT_OK(storage_->Lookup(timestamp, id, key, {}, nullptr));
+  }
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto final_drop, ApplySchema(first_drop.updated_schema.get(),
+                                   {"ALTER TABLE C DROP CONSTRAINT FK2"}));
+  GOOGLESQL_ASSERT_OK(final_drop.backfill_status);
+  EXPECT_EQ(final_drop.updated_schema->FindTable("C")->FindForeignKey("FK2"),
+            nullptr);
+  storage_->CleanUpDeletedTables(timestamp + absl::Minutes(59));
+  for (const TableID& id : index_table_ids) {
+    GOOGLESQL_EXPECT_OK(storage_->Lookup(timestamp, id, key, {}, nullptr));
+  }
+  storage_->CleanUpDeletedTables(timestamp + absl::Hours(1));
+  for (const TableID& id : index_table_ids) {
+    EXPECT_THAT(storage_->Lookup(timestamp, id, key, {}, nullptr),
+                googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  }
+}
+
+TEST_P(StorageCleanupTest, InvalidBatchDoesNotScheduleStorageCleanup) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto schema, CreatePopulatedSchema());
+  EXPECT_FALSE(
+      ApplySchema(schema.get(), {"DROP INDEX I", "DROP INDEX Missing"}).ok());
+  storage_->CleanUpDeletedTables(absl::UnixEpoch() + absl::Hours(1));
+  GOOGLESQL_EXPECT_OK(storage_->Lookup(
+      absl::UnixEpoch(), schema->FindIndex("I")->index_data_table()->id(),
+      Key({googlesql::values::Int64(1)}), {}, nullptr));
+}
+
+TEST_P(StorageCleanupTest, ValidationDoesNotScheduleStorageCleanup) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto schema, CreatePopulatedSchema());
+  GOOGLESQL_ASSERT_OK(UpdateSchema(schema.get(), {"DROP INDEX I"}).status());
+  storage_->CleanUpDeletedTables(absl::UnixEpoch() + absl::Hours(1));
+  GOOGLESQL_EXPECT_OK(storage_->Lookup(
+      absl::UnixEpoch(), schema->FindIndex("I")->index_data_table()->id(),
+      Key({googlesql::values::Int64(1)}), {}, nullptr));
+}
+
+TEST_P(StorageCleanupTest, FailedBackfillDoesNotScheduleLaterStorageCleanup) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto schema, CreatePopulatedSchema());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto applied,
+      ApplySchema(schema.get(),
+                  {"CREATE UNIQUE INDEX Bad ON T(v)", "DROP INDEX I"}));
+  EXPECT_FALSE(applied.backfill_status.ok());
+  EXPECT_EQ(applied.num_successful_statements, 0);
+  EXPECT_EQ(applied.updated_schema, nullptr);
+  storage_->CleanUpDeletedTables(absl::UnixEpoch() + absl::Hours(1));
+  GOOGLESQL_EXPECT_OK(storage_->Lookup(
+      absl::UnixEpoch(), schema->FindIndex("I")->index_data_table()->id(),
+      Key({googlesql::values::Int64(1)}), {}, nullptr));
+}
+
+TEST_P(StorageCleanupTest,
+       FailedBackfillReclaimsOnlySuccessfullyDroppedStorage) {
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(auto schema, CreatePopulatedSchema());
+  GOOGLESQL_ASSERT_OK_AND_ASSIGN(
+      auto applied,
+      ApplySchema(
+          schema.get(),
+          {"DROP INDEX I", "CREATE UNIQUE INDEX Bad ON T(v)", "DROP INDEX J"}));
+  EXPECT_FALSE(applied.backfill_status.ok());
+  EXPECT_EQ(applied.num_successful_statements, 1);
+  ASSERT_NE(applied.updated_schema, nullptr);
+  EXPECT_EQ(applied.updated_schema->FindIndex("I"), nullptr);
+  EXPECT_NE(applied.updated_schema->FindIndex("J"), nullptr);
+  storage_->CleanUpDeletedTables(absl::UnixEpoch() + absl::Hours(1));
+  EXPECT_THAT(storage_->Lookup(absl::UnixEpoch(),
+                               schema->FindIndex("I")->index_data_table()->id(),
+                               Key({googlesql::values::Int64(1)}), {}, nullptr),
+              googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  GOOGLESQL_EXPECT_OK(storage_->Lookup(
+      absl::UnixEpoch(), schema->FindIndex("J")->index_data_table()->id(),
+      Key({googlesql::values::Int64(1)}), {}, nullptr));
 }
 
 TEST_P(SchemaUpdaterTest, DropIndexIfExists) {

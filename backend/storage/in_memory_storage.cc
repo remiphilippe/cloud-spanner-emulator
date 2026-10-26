@@ -293,8 +293,10 @@ void InMemoryStorage::CleanUpDeletedColumns(absl::Time timestamp) {
   for (auto it = dropped_columns_.begin();
        it != dropped_columns_.upper_bound(expiration_time);) {
     auto [table_id, column_id] = it->second;
-    for (auto& [_, row] : tables_[table_id]) {
-      row.erase(column_id);
+    if (auto table = tables_.find(table_id); table != tables_.end()) {
+      for (auto& [_, row] : table->second) {
+        row.erase(column_id);
+      }
     }
     it = dropped_columns_.erase(it);
   }
@@ -303,15 +305,16 @@ void InMemoryStorage::CleanUpDeletedColumns(absl::Time timestamp) {
 void InMemoryStorage::MarkDroppedTable(absl::Time timestamp,
                                        TableID dropped_table_id) {
   absl::MutexLock lock(mu_);
-  dropped_tables_[timestamp] = dropped_table_id;
+  dropped_tables_.emplace(timestamp, std::move(dropped_table_id));
 }
 
 void InMemoryStorage::MarkDroppedColumn(absl::Time timestamp,
                                         TableID dropped_table_id,
                                         ColumnID dropped_column_id) {
   absl::MutexLock lock(mu_);
-  dropped_columns_[timestamp] =
-      std::make_pair(dropped_table_id, dropped_column_id);
+  dropped_columns_.emplace(timestamp,
+                           std::make_pair(std::move(dropped_table_id),
+                                          std::move(dropped_column_id)));
 }
 
 }  // namespace backend

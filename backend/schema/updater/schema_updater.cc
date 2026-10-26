@@ -812,8 +812,6 @@ class SchemaUpdaterImpl {
   // Holds the database id for this schema updater.
   std::string database_id_;
 
-  std::vector<TableID> dropped_tables_;
-  std::vector<std::pair<TableID, ColumnID>> dropped_columns_;
 };
 
 absl::Status SchemaUpdaterImpl::Init() {
@@ -1324,17 +1322,6 @@ SchemaUpdaterImpl::ApplyDDLStatements(
     // work.
     pending_work.emplace_back(std::move(statement_context));
 
-    if (storage_ != nullptr) {
-      for (auto& table_id : dropped_tables_) {
-        storage_->MarkDroppedTable(schema_change_timestamp_, table_id);
-      }
-      dropped_tables_.clear();
-      for (auto& [table_id, column_id] : dropped_columns_) {
-        storage_->MarkDroppedColumn(schema_change_timestamp_, table_id,
-                                    column_id);
-      }
-      dropped_columns_.clear();
-    }
   }
 
   return pending_work;
@@ -6101,7 +6088,6 @@ absl::Status SchemaUpdaterImpl::AlterTable(
               return absl::OkStatus();
             }));
       }
-      dropped_columns_.push_back({table->id(), column->id()});
       return absl::OkStatus();
     }
     case ddl::AlterTable::kAddRowDeletionPolicy: {
@@ -6678,7 +6664,6 @@ absl::Status SchemaUpdaterImpl::DropTable(const ddl::DropTable& drop_table) {
             }));
       }
     }
-    dropped_tables_.push_back(table->id());
   }
   return status;
 }
@@ -6869,11 +6854,7 @@ absl::Status SchemaUpdaterImpl::DropQueue(const ddl::DropQueue& drop_queue) {
     return error::QueueNotFound(drop_queue.queue_name());
   }
 
-  absl::Status status = DropNode(queue);
-  if (status.ok() && queue->backing_table() != nullptr) {
-    dropped_tables_.push_back(queue->backing_table()->id());
-  }
-  return status;
+  return DropNode(queue);
 }
 
 absl::Status SchemaUpdaterImpl::DropIndex(const ddl::DropIndex& drop_index) {
@@ -7563,6 +7544,45 @@ SchemaUpdaterImpl::DropProtoBundle() {
   return ProtoBundle::CreateEmpty();
 }
 
+// Register physical data removed by an applied statement, including backing
+// tables deleted implicitly by schema graph canonicalization.
+void MarkDroppedStorage(const SchemaValidationContext& statement) {
+  Storage* storage = statement.storage();
+  if (storage == nullptr) {
+    return;
+  }
+  absl::flat_hash_map<TableID, const Table*> retained_tables;
+  for (const SchemaNode* node :
+       statement.validated_new_schema()->GetSchemaGraph()->GetSchemaNodes()) {
+    if (const Table* table = node->As<Table>()) {
+      retained_tables.emplace(table->id(), table);
+    }
+  }
+  for (const SchemaNode* node :
+       statement.old_schema()->GetSchemaGraph()->GetSchemaNodes()) {
+    const Table* table = node->As<Table>();
+    if (table == nullptr) {
+      continue;
+    }
+    auto retained = retained_tables.find(table->id());
+    if (retained == retained_tables.end()) {
+      storage->MarkDroppedTable(statement.pending_commit_timestamp(),
+                                table->id());
+      continue;
+    }
+    absl::flat_hash_set<ColumnID> retained_column_ids;
+    for (const Column* column : retained->second->columns()) {
+      retained_column_ids.insert(column->id());
+    }
+    for (const Column* column : table->columns()) {
+      if (!retained_column_ids.contains(column->id())) {
+        storage->MarkDroppedColumn(statement.pending_commit_timestamp(),
+                                   table->id(), column->id());
+      }
+    }
+  }
+}
+
 const Schema* EmptySchema(std::string_view database_id,
                           database_api::DatabaseDialect dialect) {
   if (dialect == database_api::DatabaseDialect::POSTGRESQL) {
@@ -7644,6 +7664,13 @@ absl::StatusOr<SchemaChangeResult> SchemaUpdater::UpdateSchemaFromDDL(
         num_successful - 1));
   }
   GOOGLESQL_RET_CHECK_LE(num_successful, intermediate_schemas_.size());
+  // Validation-only calls and failed statements must never schedule deletion
+  // of storage that is still referenced by the active schema. Walk every
+  // applied statement so objects created and dropped within a batch are
+  // covered.
+  for (int i = 0; i < num_successful; ++i) {
+    MarkDroppedStorage(pending_work_[i]);
+  }
   return SchemaChangeResult{
       .num_successful_statements = num_successful,
       .updated_schema = std::move(new_schema),

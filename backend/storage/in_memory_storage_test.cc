@@ -726,6 +726,52 @@ TEST_F(InMemoryStorageTest, DroppedTablesAreRemovedAfterRetentionPeriod) {
       storage_.Lookup(t0, kTableId1, Key({Int64(10)}), {kColumnID}, &values));
 }
 
+TEST_F(InMemoryStorageTest, TablesDroppedAtSameTimestampAreAllRemoved) {
+  const absl::Time timestamp = absl::UnixEpoch();
+  const Key key({Int64(1)});
+  for (const TableID& table_id : {kTableId0, kTableId1}) {
+    GOOGLESQL_ASSERT_OK(storage_.Write(timestamp, table_id, key, {kColumnID},
+                                       {String("retained")}));
+    storage_.MarkDroppedTable(timestamp, table_id);
+  }
+  storage_.CleanUpDeletedTables(timestamp + absl::Minutes(59));
+  for (const TableID& table_id : {kTableId0, kTableId1}) {
+    GOOGLESQL_EXPECT_OK(storage_.Lookup(timestamp, table_id, key, {}, nullptr));
+  }
+  storage_.CleanUpDeletedTables(timestamp + absl::Hours(1));
+  for (const TableID& table_id : {kTableId0, kTableId1}) {
+    EXPECT_THAT(storage_.Lookup(timestamp, table_id, key, {}, nullptr),
+                googlesql_base::testing::StatusIs(absl::StatusCode::kNotFound));
+  }
+}
+
+TEST_F(InMemoryStorageTest, ColumnsDroppedAtSameTimestampAreAllRemoved) {
+  const absl::Time timestamp = absl::UnixEpoch();
+  const Key key({Int64(1)});
+  for (const TableID& table_id : {kTableId0, kTableId1}) {
+    GOOGLESQL_ASSERT_OK(storage_.Write(timestamp, table_id, key,
+                                       {kColumnID, "other", "kept"},
+                                       {Int64(1), Int64(2), Int64(3)}));
+    storage_.MarkDroppedColumn(timestamp, table_id, kColumnID);
+    storage_.MarkDroppedColumn(timestamp, table_id, "other");
+  }
+  storage_.CleanUpDeletedColumns(timestamp + absl::Minutes(59));
+  for (const TableID& table_id : {kTableId0, kTableId1}) {
+    std::vector<googlesql::Value> values;
+    GOOGLESQL_ASSERT_OK(storage_.Lookup(timestamp, table_id, key,
+                                        {kColumnID, "other", "kept"}, &values));
+    EXPECT_THAT(values, testing::ElementsAre(Int64(1), Int64(2), Int64(3)));
+  }
+  storage_.CleanUpDeletedColumns(timestamp + absl::Hours(1));
+  for (const TableID& table_id : {kTableId0, kTableId1}) {
+    std::vector<googlesql::Value> values;
+    GOOGLESQL_ASSERT_OK(storage_.Lookup(timestamp, table_id, key,
+                                        {kColumnID, "other", "kept"}, &values));
+    EXPECT_THAT(values, testing::ElementsAre(googlesql::Value(),
+                                             googlesql::Value(), Int64(3)));
+  }
+}
+
 TEST_F(InMemoryStorageTest, DroppedColumnsAreRemovedAfterRetentionPeriod) {
   absl::Time t0 = absl::Now();
 

@@ -73,6 +73,14 @@ tracks the default branch only. The multi-platform tag is published after both
 architectures pass an image smoke test for the foreign-key regression and the
 upstream command, ports, and license archive.
 
+The fork also preserves omitted defaulted columns in partial update mutations
+when a primary key has a default or generated expression, schedules dropped
+index storage for cleanup after the version retention period, preserves REST
+constraint error codes and messages, and terminates and reaps the backend when
+the gateway receives SIGINT or SIGTERM. Publication checks exercise partial
+updates, REST constraint errors, and shutdown of the standalone gateway on both
+architectures in addition to the managed foreign-key index regression.
+
 For reproducible tests, use the multi-platform digest printed in the workflow's
 publication summary:
 

@@ -100,10 +100,10 @@ class InMemoryStorage : public Storage {
   Tables tables_ ABSL_GUARDED_BY(mu_);
 
   // Tracks when tables were dropped so that we can clean up the data.
-  std::map<absl::Time, TableID> dropped_tables_ ABSL_GUARDED_BY(mu_);
+  std::multimap<absl::Time, TableID> dropped_tables_ ABSL_GUARDED_BY(mu_);
 
   // Tracks when columns were dropped so that we can clean up the data.
-  std::map<absl::Time, std::pair<TableID, ColumnID>> dropped_columns_
+  std::multimap<absl::Time, std::pair<TableID, ColumnID>> dropped_columns_
       ABSL_GUARDED_BY(mu_);
 
   mutable absl::Mutex version_retention_period_mu_ ABSL_ACQUIRED_AFTER(mu_);

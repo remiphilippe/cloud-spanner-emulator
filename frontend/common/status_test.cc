@@ -18,6 +18,11 @@
 
 #include <string>
 
+#include "google/rpc/error_details.pb.h"
+#include "google/rpc/status.pb.h"
+#include "absl/strings/cord.h"
+#include "common/constants.h"
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "googlesql/base/testing/status_matchers.h"
@@ -38,6 +43,29 @@ TEST(GrpcStatusConversion, MessageLength) {
                                         error_message))
                   .error_message(),
               testing::EndsWith("..."));
+}
+
+TEST(GrpcStatusConversion, ConstraintMarkerIsNotSerializedAsProtoDetail) {
+  absl::Status status = absl::FailedPreconditionError("Foreign key violation");
+  status.SetPayload(kConstraintError, absl::Cord(""));
+  google::rpc::ResourceInfo resource;
+  resource.set_resource_name("test-table");
+  status.SetPayload(kResourceInfoType,
+                    absl::Cord(resource.SerializeAsString()));
+
+  const grpc::Status grpc_status = ToGRPCStatus(status);
+  EXPECT_EQ(grpc_status.error_code(), grpc::StatusCode::FAILED_PRECONDITION);
+  EXPECT_EQ(grpc_status.error_message(), "Foreign key violation");
+  google::rpc::Status details;
+  ASSERT_TRUE(details.ParseFromString(grpc_status.error_details()));
+  EXPECT_EQ(details.code(),
+            static_cast<int>(absl::StatusCode::kFailedPrecondition));
+  EXPECT_EQ(details.message(), "Foreign key violation");
+  ASSERT_EQ(details.details_size(), 1);
+  google::rpc::ResourceInfo decoded;
+  ASSERT_TRUE(details.details(0).UnpackTo(&decoded));
+  EXPECT_EQ(decoded.resource_name(), "test-table");
+  EXPECT_TRUE(status.GetPayload(kConstraintError).has_value());
 }
 
 }  // namespace

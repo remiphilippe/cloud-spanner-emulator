@@ -222,6 +222,34 @@ TEST_P(ColumnDefaultValueReadWriteTest, UpdateAndDeleteMutations) {
               IsOkAndHoldsRows({{1, 1, 2, 22}}));
 }
 
+TEST_P(ColumnDefaultValueReadWriteTest,
+       UpdatePreservesDefaultsWithDefaultPrimaryKey) {
+  if (GetParam() == database_api::DatabaseDialect::POSTGRESQL) {
+    GOOGLESQL_ASSERT_OK(SetSchema({R"sql(CREATE TABLE update_defaults (
+      id bigint DEFAULT (1), status varchar(16) NOT NULL DEFAULT ('draft'),
+      n bigint NOT NULL DEFAULT (0), nullable_default bigint DEFAULT (7),
+      total bigint, computed bigint GENERATED ALWAYS AS (n + total) STORED,
+      PRIMARY KEY (id)))sql"}));
+  } else {
+    GOOGLESQL_ASSERT_OK(SetSchema({R"sql(CREATE TABLE update_defaults (
+      id INT64 DEFAULT (1), status STRING(16) NOT NULL DEFAULT ('draft'),
+      n INT64 NOT NULL DEFAULT (0), nullable_default INT64 DEFAULT (7),
+      total INT64, computed INT64 AS (n + total) STORED
+    ) PRIMARY KEY (id))sql"}));
+  }
+  GOOGLESQL_ASSERT_OK(Insert("update_defaults",
+                             {"id", "status", "n", "nullable_default", "total"},
+                             {1, "sent", 5, Null<std::int64_t>(), 10}));
+  GOOGLESQL_ASSERT_OK(Update("update_defaults", {"id", "total"}, {1, 11}));
+  EXPECT_THAT(
+      ReadAll("update_defaults",
+              {"id", "status", "n", "nullable_default", "total", "computed"}),
+      IsOkAndHoldsRows({{1, "sent", 5, Null<std::int64_t>(), 11, 16}}));
+  GOOGLESQL_ASSERT_OK(Update("update_defaults", {"id", "n"}, {1, 6}));
+  EXPECT_THAT(ReadAll("update_defaults", {"status", "n", "total", "computed"}),
+              IsOkAndHoldsRows({{"sent", 6, 11, 17}}));
+}
+
 TEST_P(ColumnDefaultValueReadWriteTest, ReplaceMutations) {
   // All user values
   GOOGLESQL_ASSERT_OK(InsertOrUpdate("t", {"k", "d1", "d2"}, {1, 11, 22}));

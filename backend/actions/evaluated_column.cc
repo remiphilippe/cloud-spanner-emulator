@@ -190,6 +190,13 @@ absl::Status EvaluatedColumnEffector::Effect(
   // Evaluate evaluated columns in topological order.
   for (int i = 0; i < evaluated_columns_.size(); ++i) {
     const Column* evaluated_column = evaluated_columns_[i];
+    // Updates must preserve omitted non-key defaults. They are evaluated by the
+    // non-key effector only when the column has an ON UPDATE expression.
+    if (op.type == MutationOpType::kUpdate &&
+        evaluated_column->has_default_value() &&
+        !IsKeyColumn(evaluated_column)) {
+      continue;
+    }
     if (!evaluated_column->has_default_value() &&
         !IsKeyColumn(evaluated_column)) {
       // skip non-key columns except default columns since generated key columns
@@ -234,6 +241,15 @@ absl::Status EvaluatedColumnEffector::Effect(
       // Calculate values of evaluated columns for each row.
       for (int j = 0; j < op.columns.size(); ++j) {
         row_column_values[i][op.columns[j]] = op.rows[i][j];
+      }
+      if (op.type == MutationOpType::kUpdate &&
+          evaluated_column->is_generated()) {
+        for (const Column* dependency : evaluated_column->dependent_columns()) {
+          if (!row_column_values[i].contains(dependency->Name())) {
+            return error::NeedAllDependentColumnsForGpk(
+                evaluated_column->FullName());
+          }
+        }
       }
       GOOGLESQL_ASSIGN_OR_RETURN(
           googlesql::Value value,
