@@ -91,6 +91,21 @@ def smoke_test(endpoint):
             "id INT64 NOT NULL DEFAULT (1), "
             "status STRING(16) NOT NULL DEFAULT ('draft'), "
             "n INT64 NOT NULL DEFAULT (0), total INT64) PRIMARY KEY (id)",
+            "CREATE TABLE position_parent ("
+            "key_a INT64 NOT NULL, key_b INT64 NOT NULL, "
+            "extra_c INT64 NOT NULL, extra_d INT64 NOT NULL) "
+            "PRIMARY KEY (key_a, key_b)",
+            "CREATE TABLE position_child ("
+            "id INT64 NOT NULL, primary_b INT64 NOT NULL, "
+            "primary_a INT64 NOT NULL, managed_a INT64 NOT NULL, "
+            "managed_c INT64 NOT NULL, managed_d INT64 NOT NULL, "
+            "managed_b INT64 NOT NULL) PRIMARY KEY (id)",
+            "ALTER TABLE position_child ADD CONSTRAINT fk_primary_permuted "
+            "FOREIGN KEY (primary_b, primary_a) "
+            "REFERENCES position_parent (key_b, key_a)",
+            "ALTER TABLE position_child ADD CONSTRAINT fk_managed_permuted "
+            "FOREIGN KEY (managed_a, managed_c, managed_d, managed_b) "
+            "REFERENCES position_parent (key_a, extra_c, extra_d, key_b)",
         ],
     }))
     session = request("POST", database + "/sessions", {})["name"]
@@ -136,6 +151,25 @@ def smoke_test(endpoint):
     if rows.get("rows") != [["sent", "5", "11"]]:
         raise RuntimeError(f"Partial update reset omitted columns: {rows}")
     print("Partial update preserved omitted defaulted columns.")
+
+    rows = request("POST", session + ":executeSql", {
+        "sql": "SELECT CONSTRAINT_NAME, COLUMN_NAME, ORDINAL_POSITION, "
+        "POSITION_IN_UNIQUE_CONSTRAINT "
+        "FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
+        "WHERE CONSTRAINT_NAME IN ('fk_primary_permuted', 'fk_managed_permuted') "
+        "ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+    })
+    expected = [
+        ["fk_managed_permuted", "managed_a", "1", "1"],
+        ["fk_managed_permuted", "managed_c", "2", "3"],
+        ["fk_managed_permuted", "managed_d", "3", "4"],
+        ["fk_managed_permuted", "managed_b", "4", "2"],
+        ["fk_primary_permuted", "primary_b", "1", "2"],
+        ["fk_primary_permuted", "primary_a", "2", "1"],
+    ]
+    if rows.get("rows") != expected:
+        raise RuntimeError(f"Foreign-key key positions did not match: {rows}")
+    print("Foreign-key key positions matched referenced physical order.")
 
 
 if __name__ == "__main__":

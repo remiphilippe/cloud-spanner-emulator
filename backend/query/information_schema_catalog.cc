@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -2506,6 +2507,18 @@ void InformationSchemaCatalog::FillKeyColumnUsageTable() {
       // Add the foreign key referencing columns.
       int foreign_key_ordinal = 1;
       for (const auto* column : foreign_key->referencing_columns()) {
+        const Column* referenced_column =
+            foreign_key->referenced_columns()[foreign_key_ordinal - 1];
+        absl::Span<const KeyColumn* const> referenced_key_columns =
+            foreign_key->referenced_index()
+                ? foreign_key->referenced_index()->key_columns()
+                : foreign_key->referenced_table()->primary_key();
+        auto referenced_key = std::find_if(
+            referenced_key_columns.begin(), referenced_key_columns.end(),
+            [referenced_column](const KeyColumn* key_column) {
+              return key_column->column() == referenced_column;
+            });
+        ABSL_CHECK(referenced_key != referenced_key_columns.end());
         rows.push_back({
             // constraint_catalog
             DialectTableCatalog(),
@@ -2524,7 +2537,9 @@ void InformationSchemaCatalog::FillKeyColumnUsageTable() {
             // ordinal_position
             Int64(foreign_key_ordinal),
             // position_in_unique_constraint
-            Int64(foreign_key_ordinal),
+            Int64(std::distance(referenced_key_columns.begin(),
+                                referenced_key) +
+                  1),
         });
         ++foreign_key_ordinal;
       }

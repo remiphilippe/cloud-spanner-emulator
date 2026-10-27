@@ -3974,6 +3974,60 @@ TEST_P(ForeignKeyInformationSchemaTest, DefaultKeyColumnUsage) {
   EXPECT_THAT(results, IsOkAndHoldsRows(expected));
 }
 
+TEST_P(ForeignKeyInformationSchemaTest,
+       KeyColumnUsageTracksReferencedPhysicalOrder) {
+  if (GetParam() == POSTGRESQL) {
+    GTEST_SKIP() << "This regression covers the GoogleSQL catalog used by the "
+                    "managed-index authoring flow.";
+  }
+  GOOGLESQL_ASSERT_OK(SetSchema({R"(
+    CREATE TABLE position_parent (
+      key_a INT64 NOT NULL,
+      key_b INT64 NOT NULL,
+      extra_c INT64 NOT NULL,
+      extra_d INT64 NOT NULL,
+    ) PRIMARY KEY (key_a, key_b)
+  )",
+                                 R"(
+    CREATE TABLE position_child (
+      id INT64 NOT NULL,
+      primary_b INT64 NOT NULL,
+      primary_a INT64 NOT NULL,
+      managed_a INT64 NOT NULL,
+      managed_c INT64 NOT NULL,
+      managed_d INT64 NOT NULL,
+      managed_b INT64 NOT NULL,
+    ) PRIMARY KEY (id)
+  )",
+                                 R"(
+    ALTER TABLE position_child ADD CONSTRAINT fk_primary_permuted
+      FOREIGN KEY (primary_b, primary_a)
+      REFERENCES position_parent (key_b, key_a)
+  )",
+                                 R"(
+    ALTER TABLE position_child ADD CONSTRAINT fk_managed_permuted
+      FOREIGN KEY (managed_a, managed_c, managed_d, managed_b)
+      REFERENCES position_parent (key_a, extra_c, extra_d, key_b)
+  )"}));
+
+  auto results = Query(R"(
+    SELECT constraint_name, column_name, ordinal_position,
+           position_in_unique_constraint
+    FROM information_schema.key_column_usage
+    WHERE constraint_name IN ('fk_primary_permuted', 'fk_managed_permuted')
+    ORDER BY constraint_name, ordinal_position
+  )");
+  LogResults(results);
+  EXPECT_THAT(results, IsOkAndHoldsRows({
+                           {"fk_managed_permuted", "managed_a", 1, 1},
+                           {"fk_managed_permuted", "managed_c", 2, 3},
+                           {"fk_managed_permuted", "managed_d", 3, 4},
+                           {"fk_managed_permuted", "managed_b", 4, 2},
+                           {"fk_primary_permuted", "primary_b", 1, 2},
+                           {"fk_primary_permuted", "primary_a", 2, 1},
+                       }));
+}
+
 TEST_P(ForeignKeyInformationSchemaTest, DefaultReferentialConstraints) {
   auto results = Query(absl::Substitute(
       R"(
