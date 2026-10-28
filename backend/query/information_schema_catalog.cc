@@ -2516,7 +2516,13 @@ void InformationSchemaCatalog::FillKeyColumnUsageTable() {
         auto referenced_key = std::find_if(
             referenced_key_columns.begin(), referenced_key_columns.end(),
             [referenced_column](const KeyColumn* key_column) {
-              return key_column->column() == referenced_column;
+              // Index keys use hidden data-table columns; match their sources.
+              const Column* key_source_column =
+                  key_column->column()->source_column();
+              if (key_source_column == nullptr) {
+                key_source_column = key_column->column();
+              }
+              return key_source_column->id() == referenced_column->id();
             });
         ABSL_CHECK(referenced_key != referenced_key_columns.end());
         rows.push_back({
